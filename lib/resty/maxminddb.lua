@@ -359,4 +359,116 @@ end
 -- copy from https://github.com/lilien1010/lua-resty-maxminddb/blob/master/resty/maxminddb.lua#L208
 -- https://www.maxmind.com/en/geoip2-databases  you should download  the mmdb file from maxmind
 
+function _M.open(dbfile)
+  local db = ffi_new('MMDB_s')
+  local maxmind_ready = maxm.MMDB_open(dbfile,0,db)
+  if maxmind_ready ~= MMDB_SUCCESS then
+    return nil, mmdb_strerror(maxmind_ready)
+  end
+  return db, nil
+end
+
+local db_mt = {}
+db_mt.__index = db_mt
+
+function db_mt:close()
+  maxm.MMDB_close(self)
+end
+
+function db_mt:lookup(ip)
+  local gai_error = ffi_new('int[1]')
+  local mmdb_error = ffi_new('int[1]')
+
+  local result = maxm.MMDB_lookup_string(self,ip,gai_error,mmdb_error)
+  if mmdb_error[0] ~= MMDB_SUCCESS then
+    return nil,'lookup failed: ' .. mmdb_strerror(mmdb_error[0])
+  end
+  if gai_error[0] ~= MMDB_SUCCESS then
+    return nil,'lookup failed: ' .. gai_strerror(gai_error[0])
+  end
+  if true ~= result.found_entry then
+    return nil,'not found'
+  end
+
+  local entry_data_list = ffi_cast('MMDB_entry_data_list_s **const',ffi_new("MMDB_entry_data_list_s"))
+
+  local status = maxm.MMDB_get_entry_data_list(result.entry,entry_data_list)
+  if status ~= MMDB_SUCCESS then
+    return nil,'get entry data failed: ' .. mmdb_strerror(status)
+  end
+
+  local head = entry_data_list[0] -- Save so this can be passed to free fn.
+  local _,status,result = _dump_entry_data_list(entry_data_list)
+
+  maxm.MMDB_free_entry_data_list(head)
+  if status ~= MMDB_SUCCESS then
+    return nil,'dump entry data failed: ' .. mmdb_strerror(status)
+  end
+
+  return result
+end
+
+function build_country_iso_code_path()
+  local segments = ffi_new('const char *[3]')
+  segments[0] = 'country'
+  segments[1] = 'iso_code'
+  segments[2] = nil
+  return segments
+end
+
+local country_iso_code_path = build_country_iso_code_path()
+
+--- Lookup an IP address and return country.iso_code attribute.
+-- @param ip The IP address string
+-- @return an ISO code string if both the IP address and the attribute are found.
+--         nil if the IP address is found but the attribute is not found.
+--         nil and an error string on error.
+--         The error string is 'not found' when the IP address is not found.
+function db_mt:lookup_country_iso_code(ip)
+  local gai_error = ffi_new('int[1]')
+  local mmdb_error = ffi_new('int[1]')
+  local result = maxm.MMDB_lookup_string(self,ip,gai_error,mmdb_error)
+  if mmdb_error[0] ~= MMDB_SUCCESS then
+    return nil,'lookup failed#1: ' .. mmdb_strerror(mmdb_error[0])
+  end
+  if gai_error[0] ~= MMDB_SUCCESS then
+    return nil,'lookup failed#2: ' .. gai_strerror(gai_error[0])
+  end
+  if not result.found_entry then
+    return nil,'not found'
+  end
+
+  local entry_data = ffi_new('MMDB_entry_data_s')
+
+  local status = maxm.MMDB_aget_value(result.entry,entry_data,country_iso_code_path)
+  if status ~= MMDB_SUCCESS or entry_data.offset == 0 then
+    return nil
+  end
+
+  local entry_data_list = ffi_cast('MMDB_entry_data_list_s **const',ffi_new("MMDB_entry_data_list_s"))
+  local entry = ffi_new('MMDB_entry_s')
+  entry.mmdb = self
+  entry.offset = entry_data.offset
+  status = maxm.MMDB_get_entry_data_list(entry,entry_data_list)
+  if status ~= MMDB_SUCCESS then
+    return nil,'get entry data failed: ' .. mmdb_strerror(status)
+  end
+
+  local entry_data_item = entry_data_list[0].entry_data
+  data_type = entry_data_item.type
+  data_size = entry_data_item.data_size
+  local iso_code
+  if data_type == MMDB_DATA_TYPE_UTF8_STRING then
+    iso_code = ffi_str(entry_data_item.utf8_string,data_size)
+  end
+  maxm.MMDB_free_entry_data_list(entry_data_list[0])
+  if data_type ~= MMDB_DATA_TYPE_UTF8_STRING then
+    return nil,MMDB_INVALID_DATA_ERROR
+  end
+
+  return iso_code
+end
+
+ffi.metatype('MMDB_s', db_mt)
+
 return _M;
